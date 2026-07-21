@@ -54,17 +54,16 @@ const EditorRoom = () => {
   const [remoteCursors, setRemoteCursors] = useState<Record<string, RemoteCursor>>({});
   const [userCount, setUserCount] = useState(1);
   const [toast, setToast] = useState<string | null>(null);
-  const [sidebarTab, setSidebarTab] = useState<"participants" | "chat">("participants");
   const [outputTab, setOutputTab] = useState<"output" | "input">("output");
-  const [chatMessages, setChatMessages] = useState<{ user: string; text: string; time: string }[]>([]);
-  const [chatInput, setChatInput] = useState("");
   const [consoleOpen, setConsoleOpen] = useState(true);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [profileMenuOpen, setProfileMenuOpen] = useState(false);
   const [reconnecting, setReconnecting] = useState(false);
 
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const myColor = useRef(USER_COLORS[Math.floor(Math.random() * USER_COLORS.length)]);
+  const [myColor] = useState(
+    () => USER_COLORS[Math.floor(Math.random() * USER_COLORS.length)]
+  );
   const joinedRoomRef = useRef<string | null>(null);
   const latestCodeRef = useRef(code);
   const latestLanguageRef = useRef(language);
@@ -365,17 +364,6 @@ const EditorRoom = () => {
     showToast("Room link copied to clipboard!");
   };
 
-  const sendChat = () => {
-    if (!chatInput.trim()) return;
-    const msg = {
-      user: username,
-      text: chatInput.trim(),
-      time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-    };
-    setChatMessages(prev => [...prev, msg]);
-    setChatInput("");
-  };
-
   const initials = (name: string) =>
     name.split(" ").map(w => w[0]).join("").toUpperCase().slice(0, 2);
 
@@ -506,7 +494,7 @@ const EditorRoom = () => {
             id="editor-profile"
             onClick={() => setProfileMenuOpen(!profileMenuOpen)}
             className="w-7 h-7 rounded-full flex items-center justify-center text-[11px] font-bold text-white hover:ring-2 hover:ring-blue-500/50 transition-all"
-            style={{ background: myColor.current }}
+            style={{ background: myColor }}
           >
             {initials(username)}
           </button>
@@ -546,33 +534,20 @@ const EditorRoom = () => {
         {sidebarOpen && (
           <aside className="w-52 flex-shrink-0 flex flex-col border-r border-white/5"
             style={{ background: "rgba(13,17,27,0.95)" }}>
-            {/* Tabs */}
-            <div className="flex border-b border-white/5">
-              {(["participants", "chat"] as const).map(tab => (
-                <button
-                  key={tab}
-                  onClick={() => setSidebarTab(tab)}
-                  className={`flex-1 py-2.5 text-xs font-medium capitalize transition-colors ${
-                    sidebarTab === tab
-                      ? "text-white border-b-2 border-blue-500"
-                      : "text-slate-500 hover:text-slate-300"
-                  }`}
-                >
-                  {tab}
-                </button>
-              ))}
+            <div className="border-b border-white/5 px-4 py-3">
+              <div className="text-[10px] text-slate-600 uppercase tracking-[0.22em]">
+                Participants
+              </div>
             </div>
 
-            {/* Participants Tab */}
-            {sidebarTab === "participants" && (
-              <div className="flex-1 overflow-y-auto p-3">
+            <div className="flex-1 overflow-y-auto p-3">
                 <div className="text-[10px] text-slate-600 uppercase tracking-wider mb-2 px-1">
                   Online — {userCount}
                 </div>
                 {/* Self */}
                 <div className="flex items-center gap-2.5 px-2 py-2 rounded-lg hover:bg-white/3">
                   <div className="w-7 h-7 rounded-full flex items-center justify-center text-[10px] font-bold text-white flex-shrink-0"
-                    style={{ backgroundColor: myColor.current }}>
+                    style={{ backgroundColor: myColor }}>
                     {initials(username)}
                   </div>
                   <div className="min-w-0">
@@ -602,45 +577,7 @@ const EditorRoom = () => {
                       <span className="ml-auto w-2 h-2 rounded-full bg-green-400 flex-shrink-0" />
                     </div>
                   ))}
-              </div>
-            )}
-
-            {/* Chat Tab */}
-            {sidebarTab === "chat" && (
-              <div className="flex-1 flex flex-col overflow-hidden">
-                <div className="flex-1 overflow-y-auto p-3 space-y-2.5">
-                  {chatMessages.length === 0 ? (
-                    <div className="text-center py-6 text-slate-600 text-xs">No messages yet</div>
-                  ) : (
-                    chatMessages.map((m, i) => (
-                      <div key={i} className={`text-xs ${m.user === username ? "text-right" : ""}`}>
-                        <div className="text-[10px] text-slate-600 mb-0.5">{m.user} · {m.time}</div>
-                        <span className={`inline-block px-2.5 py-1.5 rounded-xl text-xs ${
-                          m.user === username
-                            ? "bg-blue-500/20 text-blue-200"
-                            : "bg-white/5 text-slate-300"
-                        }`}>{m.text}</span>
-                      </div>
-                    ))
-                  )}
-                </div>
-                <div className="p-2 border-t border-white/5 flex gap-1.5">
-                  <input
-                    value={chatInput}
-                    onChange={e => setChatInput(e.target.value)}
-                    onKeyDown={e => e.key === "Enter" && sendChat()}
-                    placeholder="Message…"
-                    className="flex-1 text-xs rounded-lg px-3 py-2 text-white placeholder-slate-700 outline-none"
-                    style={{ background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.08)" }}
-                  />
-                  <button onClick={sendChat} className="p-2 rounded-lg bg-blue-500/20 hover:bg-blue-500/30 text-blue-400 transition-colors">
-                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
-                    </svg>
-                  </button>
-                </div>
-              </div>
-            )}
+            </div>
           </aside>
         )}
 

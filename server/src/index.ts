@@ -1,28 +1,54 @@
+// Must be first: ./db reads process.env at import time.
+import "dotenv/config";
 import express, { NextFunction, Request, Response } from "express";
 import cors from "cors";
 import axios from "axios";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 import cookieParser from "cookie-parser";
-import dotenv from "dotenv";
 import passport from "passport";
 import { createServer } from "http";
 import { Server } from "socket.io";
 import { pool } from "./db";
-import authRouter from "./routes/authRoutes";
 
 const session = require("express-session");
 const {
   Strategy: GoogleStrategy,
 } = require("passport-google-oauth20");
 
-dotenv.config();
+const requireEnv = (name: string): string => {
+  const value = process.env[name];
+
+  if (!value) {
+    console.error(`Missing required environment variable: ${name}`);
+    console.error("Copy .env.example to .env and fill in the values.");
+    process.exit(1);
+  }
+
+  return value;
+};
+
+const JWT_SECRET = requireEnv("JWT_SECRET");
+const SESSION_SECRET = requireEnv("SESSION_SECRET");
+
+const clientUrl = process.env.CLIENT_URL || "http://localhost:5173";
+const port = Number(process.env.PORT) || 5000;
+const judge0Url =
+  process.env.JUDGE0_URL ||
+  "http://127.0.0.1:2358/submissions?base64_encoded=false&wait=true";
+
+const googleClientId = process.env.GOOGLE_CLIENT_ID;
+const googleClientSecret = process.env.GOOGLE_CLIENT_SECRET;
+const googleCallbackUrl =
+  process.env.GOOGLE_CALLBACK_URL ||
+  `http://localhost:${port}/auth/google/callback`;
+const googleAuthEnabled = Boolean(googleClientId && googleClientSecret);
 
 const app = express();
 
 app.use(
   session({
-    secret: "codemesh_google_secret",
+    secret: SESSION_SECRET,
     resave: false,
     saveUninitialized: false,
   })
@@ -37,23 +63,16 @@ app.use(express.json());
 app.use(cookieParser());
 app.use(passport.initialize());
 app.use(passport.session());
-app.use("/auth", authRouter);
 
+// Judge0 language ids — keep in sync with LANGUAGES in client/src/pages/EditorRoom.tsx
 const languageMap: Record<string, number> = {
   javascript: 63,
+  typescript: 74,
   python: 71,
   java: 62,
   cpp: 54,
   c: 50,
 };
-
-const judge0Url =
-  process.env.JUDGE0_URL ||
-  "http://127.0.0.1:2358/submissions?base64_encoded=false&wait=true";
-const clientUrl = process.env.CLIENT_URL || "http://localhost:5173";
-const port = Number(process.env.PORT) || 5000;
-const JWT_SECRET =
-  process.env.JWT_SECRET || "codemesh_secret_key";
 
 passport.serializeUser((user: any, done) => {
   done(null, user);
@@ -63,13 +82,19 @@ passport.deserializeUser((user: any, done) => {
   done(null, user as any);
 });
 
-passport.use(
+if (!googleAuthEnabled) {
+  console.warn(
+    "GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET not set — Google sign-in is disabled."
+  );
+}
+
+if (googleAuthEnabled) {
+  passport.use(
   new GoogleStrategy(
     {
-      clientID: process.env.GOOGLE_CLIENT_ID!,
-      clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
-      callbackURL:
-        "http://localhost:5000/auth/google/callback",
+      clientID: googleClientId,
+      clientSecret: googleClientSecret,
+      callbackURL: googleCallbackUrl,
     },
     async (
       _accessToken: any,
@@ -109,7 +134,8 @@ passport.use(
       }
     }
   )
-);
+  );
+}
 
 const authMiddleware = (
   req: Request,
@@ -248,36 +274,44 @@ app.post("/login", async (req, res) => {
   }
 });
 
-app.get(
-  "/auth/google",
-  passport.authenticate("google", {
-    scope: ["profile", "email"],
-  })
-);
+if (googleAuthEnabled) {
+  app.get(
+    "/auth/google",
+    passport.authenticate("google", {
+      scope: ["profile", "email"],
+    })
+  );
 
-app.get(
-  "/auth/google/callback",
-  passport.authenticate("google", {
-    failureRedirect: "/login",
-    session: false,
-  }),
-  (req: any, res) => {
-    const user = req.user;
+  app.get(
+    "/auth/google/callback",
+    passport.authenticate("google", {
+      failureRedirect: `${clientUrl}/login`,
+      session: false,
+    }),
+    (req: any, res) => {
+      const user = req.user;
 
-    const token = jwt.sign(
-      { id: user.id, email: user.email },
-      process.env.JWT_SECRET!,
-      { expiresIn: "7d" }
-    );
+      const token = jwt.sign(
+        { id: user.id, email: user.email },
+        JWT_SECRET,
+        { expiresIn: "7d" }
+      );
 
-    res.cookie("token", token, {
-      httpOnly: true,
-      sameSite: "lax",
+      res.cookie("token", token, {
+        httpOnly: true,
+        sameSite: "lax",
+      });
+
+      res.redirect(`${clientUrl}/`);
+    }
+  );
+} else {
+  app.get("/auth/google", (_req, res) => {
+    res.status(503).json({
+      message: "Google sign-in is not configured on this server.",
     });
-
-    res.redirect("http://localhost:5173/");
-  }
-);
+  });
+}
 
 app.get("/me", authMiddleware, async (req, res) => {
   try {
@@ -308,7 +342,7 @@ app.post("/logout", (req, res) => {
   });
 });
 
-app.post("/run", async (req, res) => {
+app.post("/run", authMiddleware, async (req, res) => {
   try {
     const { code, language, input } = req.body;
     const languageId = languageMap[language];
@@ -363,7 +397,7 @@ app.post("/run", async (req, res) => {
 });
 
 
-app.post("/save-room", async (req, res) => {
+app.post("/save-room", authMiddleware, async (req, res) => {
   try {
     const { roomId, code, language } = req.body;
 
@@ -389,7 +423,7 @@ app.post("/save-room", async (req, res) => {
 
 
 
-app.get("/room/:roomId", async (req, res) => {
+app.get("/room/:roomId", authMiddleware, async (req, res) => {
   try {
     const { roomId } = req.params;
 
