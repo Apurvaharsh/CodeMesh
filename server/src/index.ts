@@ -486,6 +486,35 @@ io.on("connection", (socket) => {
       socket.to(roomId).emit("receive-output", output);
     }
   );
+
+  // Ephemeral session chat. Broadcast to the whole room (sender included) so
+  // the server is the single source of ordering and clients just render what
+  // they receive — no local echo, no de-duplication.
+  socket.on(
+    "send-chat",
+    ({
+      roomId,
+      user,
+      text,
+    }: {
+      roomId: string;
+      user: string;
+      text: string;
+    }) => {
+      const trimmed = (text ?? "").toString().trim();
+      if (!roomId || !trimmed) {
+        return;
+      }
+
+      io.to(roomId).emit("receive-chat", {
+        id: `${socket.id}-${Date.now()}`,
+        senderId: socket.id,
+        user: (user ?? "Guest").toString().slice(0, 60),
+        text: trimmed.slice(0, 2000),
+        time: Date.now(),
+      });
+    }
+  );
 });
 
 attachCollabServer(httpServer, (roomId) => {

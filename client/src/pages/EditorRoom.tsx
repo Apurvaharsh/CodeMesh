@@ -31,6 +31,14 @@ interface ConnectedUser {
   isSelf: boolean;
 }
 
+interface ChatMessage {
+  id: string;
+  senderId: string;
+  user: string;
+  text: string;
+  time: number;
+}
+
 const USER_COLORS = [
   "#3b82f6", "#8b5cf6", "#06b6d4", "#10b981",
   "#f59e0b", "#ec4899", "#6366f1",
@@ -59,6 +67,10 @@ const EditorRoom = () => {
   const [outputTab, setOutputTab] = useState<"output" | "input">("output");
   const [consoleOpen, setConsoleOpen] = useState(true);
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [sidebarTab, setSidebarTab] = useState<"participants" | "chat">("participants");
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [chatInput, setChatInput] = useState("");
+  const [unreadChat, setUnreadChat] = useState(0);
   const [profileMenuOpen, setProfileMenuOpen] = useState(false);
   const [reconnecting, setReconnecting] = useState(false);
 
@@ -75,6 +87,8 @@ const EditorRoom = () => {
     () => USER_COLORS[Math.floor(Math.random() * USER_COLORS.length)]
   );
   const savingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const chatEndRef = useRef<HTMLDivElement | null>(null);
+  const lastSeenChatRef = useRef(0);
 
   const username = user?.username || localStorage.getItem("username") || "Guest";
 
@@ -258,10 +272,14 @@ const EditorRoom = () => {
       if (savingTimerRef.current) clearTimeout(savingTimerRef.current);
       setSaveStatus("saved");
     };
+    const handleReceiveChat = (message: ChatMessage) => {
+      setChatMessages((prev) => [...prev, message]);
+    };
     const joinRoom = () => socket.emit("join-room", { roomId });
 
     socket.on("receive-output", handleReceiveOutput);
     socket.on("room-saved", handleRoomSaved);
+    socket.on("receive-chat", handleReceiveChat);
     socket.on("connect", joinRoom);
 
     if (socket.connected) joinRoom();
@@ -270,9 +288,23 @@ const EditorRoom = () => {
       socket.emit("leave-room", { roomId });
       socket.off("receive-output", handleReceiveOutput);
       socket.off("room-saved", handleRoomSaved);
+      socket.off("receive-chat", handleReceiveChat);
       socket.off("connect", joinRoom);
     };
   }, [roomId, socket]);
+
+  // While chat is open, keep it scrolled to the newest message and mark
+  // everything seen; while it's hidden, badge the count of unseen messages.
+  // Tracking "seen" by count means toggling tabs never inflates the badge.
+  useEffect(() => {
+    if (sidebarOpen && sidebarTab === "chat") {
+      lastSeenChatRef.current = chatMessages.length;
+      setUnreadChat(0);
+      chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    } else {
+      setUnreadChat(chatMessages.length - lastSeenChatRef.current);
+    }
+  }, [chatMessages, sidebarOpen, sidebarTab]);
 
   // Track the room locally for the dashboard's recent list.
   useEffect(() => {
@@ -318,6 +350,15 @@ const EditorRoom = () => {
   const copyInvite = () => {
     navigator.clipboard.writeText(window.location.href);
     showToast("Room link copied to clipboard!");
+  };
+
+  const sendChat = () => {
+    const text = chatInput.trim();
+    if (!text) return;
+    // Broadcast only — the server echoes to everyone (us included), so we
+    // render from receive-chat rather than appending locally.
+    socket.emit("send-chat", { roomId, user: username, text });
+    setChatInput("");
   };
 
   const initials = (name: string) =>
@@ -491,44 +532,122 @@ const EditorRoom = () => {
         {sidebarOpen && (
           <aside className="w-52 flex-shrink-0 flex flex-col border-r border-white/5"
             style={{ background: "rgba(13,17,27,0.95)" }}>
-            <div className="border-b border-white/5 px-4 py-3">
-              <div className="text-[10px] text-slate-600 uppercase tracking-[0.22em]">
-                Participants
-              </div>
+            {/* Tabs */}
+            <div className="flex border-b border-white/5">
+              {(["participants", "chat"] as const).map((tab) => (
+                <button
+                  key={tab}
+                  onClick={() => setSidebarTab(tab)}
+                  className={`flex-1 py-2.5 text-xs font-medium capitalize transition-colors relative ${
+                    sidebarTab === tab
+                      ? "text-white border-b-2 border-blue-500"
+                      : "text-slate-500 hover:text-slate-300"
+                  }`}
+                >
+                  {tab}
+                  {tab === "chat" && unreadChat > 0 && sidebarTab !== "chat" && (
+                    <span className="absolute top-1.5 right-3 min-w-4 h-4 px-1 rounded-full bg-blue-500 text-white text-[9px] font-bold flex items-center justify-center">
+                      {unreadChat > 9 ? "9+" : unreadChat}
+                    </span>
+                  )}
+                </button>
+              ))}
             </div>
 
-            <div className="flex-1 overflow-y-auto p-3">
-              <div className="text-[10px] text-slate-600 uppercase tracking-wider mb-2 px-1">
-                Online — {userCount}
-              </div>
-
-              {/* Self */}
-              <div className="flex items-center gap-2.5 px-2 py-2 rounded-lg hover:bg-white/3">
-                <div className="w-7 h-7 rounded-full flex items-center justify-center text-[10px] font-bold text-white flex-shrink-0"
-                  style={{ backgroundColor: myColor }}>
-                  {initials(username)}
+            {/* Participants */}
+            {sidebarTab === "participants" && (
+              <div className="flex-1 overflow-y-auto p-3">
+                <div className="text-[10px] text-slate-600 uppercase tracking-wider mb-2 px-1">
+                  Online — {userCount}
                 </div>
-                <div className="min-w-0">
-                  <div className="text-xs font-medium text-white truncate">{username}</div>
-                  <div className="text-[10px] text-slate-600">You</div>
-                </div>
-                <span className="ml-auto w-2 h-2 rounded-full bg-green-400 flex-shrink-0" />
-              </div>
 
-              {/* Others — from Yjs awareness */}
-              {others.map((entry) => (
-                <div key={entry.clientId} className="flex items-center gap-2.5 px-2 py-2 rounded-lg hover:bg-white/3">
+                {/* Self */}
+                <div className="flex items-center gap-2.5 px-2 py-2 rounded-lg hover:bg-white/3">
                   <div className="w-7 h-7 rounded-full flex items-center justify-center text-[10px] font-bold text-white flex-shrink-0"
-                    style={{ backgroundColor: entry.color }}>
-                    {initials(entry.username)}
+                    style={{ backgroundColor: myColor }}>
+                    {initials(username)}
                   </div>
                   <div className="min-w-0">
-                    <div className="text-xs font-medium text-slate-300 truncate">{entry.username}</div>
+                    <div className="text-xs font-medium text-white truncate">{username}</div>
+                    <div className="text-[10px] text-slate-600">You</div>
                   </div>
                   <span className="ml-auto w-2 h-2 rounded-full bg-green-400 flex-shrink-0" />
                 </div>
-              ))}
-            </div>
+
+                {/* Others — from Yjs awareness */}
+                {others.map((entry) => (
+                  <div key={entry.clientId} className="flex items-center gap-2.5 px-2 py-2 rounded-lg hover:bg-white/3">
+                    <div className="w-7 h-7 rounded-full flex items-center justify-center text-[10px] font-bold text-white flex-shrink-0"
+                      style={{ backgroundColor: entry.color }}>
+                      {initials(entry.username)}
+                    </div>
+                    <div className="min-w-0">
+                      <div className="text-xs font-medium text-slate-300 truncate">{entry.username}</div>
+                    </div>
+                    <span className="ml-auto w-2 h-2 rounded-full bg-green-400 flex-shrink-0" />
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* Chat */}
+            {sidebarTab === "chat" && (
+              <div className="flex-1 flex flex-col overflow-hidden">
+                <div className="flex-1 overflow-y-auto p-3 space-y-2.5">
+                  {chatMessages.length === 0 ? (
+                    <div className="text-center py-6 text-slate-600 text-xs">
+                      No messages yet
+                    </div>
+                  ) : (
+                    chatMessages.map((m) => {
+                      const mine = m.senderId === socket.id;
+                      return (
+                        <div key={m.id} className={`text-xs ${mine ? "text-right" : ""}`}>
+                          <div className="text-[10px] text-slate-600 mb-0.5">
+                            {mine ? "You" : m.user} ·{" "}
+                            {new Date(m.time).toLocaleTimeString([], {
+                              hour: "2-digit",
+                              minute: "2-digit",
+                            })}
+                          </div>
+                          <span
+                            className={`inline-block px-2.5 py-1.5 rounded-xl text-xs break-words max-w-[85%] ${
+                              mine
+                                ? "bg-blue-500/20 text-blue-200"
+                                : "bg-white/5 text-slate-300"
+                            }`}
+                          >
+                            {m.text}
+                          </span>
+                        </div>
+                      );
+                    })
+                  )}
+                  <div ref={chatEndRef} />
+                </div>
+                <div className="p-2 border-t border-white/5 flex gap-1.5">
+                  <input
+                    id="editor-chat-input"
+                    value={chatInput}
+                    onChange={(e) => setChatInput(e.target.value)}
+                    onKeyDown={(e) => e.key === "Enter" && sendChat()}
+                    placeholder="Message…"
+                    maxLength={2000}
+                    className="flex-1 text-xs rounded-lg px-3 py-2 text-white placeholder-slate-700 outline-none"
+                    style={{ background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.08)" }}
+                  />
+                  <button
+                    onClick={sendChat}
+                    className="p-2 rounded-lg bg-blue-500/20 hover:bg-blue-500/30 text-blue-400 transition-colors"
+                    title="Send"
+                  >
+                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
+                    </svg>
+                  </button>
+                </div>
+              </div>
+            )}
           </aside>
         )}
 
