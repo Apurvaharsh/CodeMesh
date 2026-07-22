@@ -1,8 +1,14 @@
-import { useEffect, useState, useRef, useCallback } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import Editor from "@monaco-editor/react";
+import * as Y from "yjs";
+import { WebsocketProvider } from "y-websocket";
+import { MonacoBinding } from "y-monaco";
+import type { editor as MonacoEditorNS } from "monaco-editor";
 import { useAuth } from "../context/AuthContext";
-import { roomApi } from "../services/api";
+// Side-effect import: points @monaco-editor/react at the bundled monaco.
+import "../services/monaco";
+import { roomApi, COLLAB_WS_URL } from "../services/api";
 import { getSocket } from "../services/socket";
 
 const LANGUAGES = [
@@ -14,16 +20,15 @@ const LANGUAGES = [
   { value: "c", label: "C", icon: "🔵" },
 ];
 
+// Shared Yjs type keys — these MUST match the server (see collab.ts).
+const TEXT_KEY = "monaco";
+const META_KEY = "meta";
+
 interface ConnectedUser {
-  id: string;
+  clientId: number;
   username: string;
   color: string;
-}
-
-interface RemoteCursor {
-  userId: string;
-  line: number;
-  column: number;
+  isSelf: boolean;
 }
 
 const USER_COLORS = [
@@ -43,7 +48,6 @@ const EditorRoom = () => {
   const { user } = useAuth();
   const socket = getSocket();
 
-  const [code, setCode] = useState("// code here");
   const [language, setLanguage] = useState("javascript");
   const [input, setInput] = useState("");
   const [output, setOutput] = useState("");
@@ -51,8 +55,6 @@ const EditorRoom = () => {
   const [running, setRunning] = useState(false);
   const [saveStatus, setSaveStatus] = useState<"saved" | "saving" | "unsaved">("saved");
   const [connectedUsers, setConnectedUsers] = useState<ConnectedUser[]>([]);
-  const [remoteCursors, setRemoteCursors] = useState<Record<string, RemoteCursor>>({});
-  const [userCount, setUserCount] = useState(1);
   const [toast, setToast] = useState<string | null>(null);
   const [outputTab, setOutputTab] = useState<"output" | "input">("output");
   const [consoleOpen, setConsoleOpen] = useState(true);
@@ -60,178 +62,222 @@ const EditorRoom = () => {
   const [profileMenuOpen, setProfileMenuOpen] = useState(false);
   const [reconnecting, setReconnecting] = useState(false);
 
-  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // The Yjs document and its transport. Held in state (not a ref) so the
+  // binding effect re-runs when they are replaced.
+  const [collab, setCollab] = useState<{
+    doc: Y.Doc;
+    provider: WebsocketProvider;
+  } | null>(null);
+  const [editor, setEditor] =
+    useState<MonacoEditorNS.IStandaloneCodeEditor | null>(null);
+
   const [myColor] = useState(
     () => USER_COLORS[Math.floor(Math.random() * USER_COLORS.length)]
   );
-  const joinedRoomRef = useRef<string | null>(null);
-  const latestCodeRef = useRef(code);
-  const latestLanguageRef = useRef(language);
-  const editorRef = useRef<any>(null);
-  const monacoRef = useRef<any>(null);
-  const remoteDecorationIdsRef = useRef<string[]>([]);
+  const savingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const username = user?.username || localStorage.getItem("username") || "Guest";
 
-  const showToast = (msg: string) => {
+  const showToast = useCallback((msg: string) => {
     setToast(msg);
     setTimeout(() => setToast(null), 3000);
-  };
+  }, []);
 
-  useEffect(() => {
-    latestCodeRef.current = code;
-  }, [code]);
-
-  useEffect(() => {
-    latestLanguageRef.current = language;
-  }, [language]);
-
-  // ─── Socket Setup ────────────────────────────────────────────
+  // ─── Yjs document + transport ────────────────────────────────
   useEffect(() => {
     if (!roomId) return;
 
-    const joinRoom = () => {
-      if (!socket.connected) return;
+    const doc = new Y.Doc();
+    const provider = new WebsocketProvider(COLLAB_WS_URL, roomId, doc);
 
-      if (joinedRoomRef.current === roomId) {
-        debugRealtime("skip duplicate join", { roomId, socketId: socket.id, username });
-        return;
+    provider.awareness.setLocalStateField("user", {
+      name: username,
+      color: myColor,
+    });
+
+    const handleStatus = ({ status }: { status: string }) => {
+      debugRealtime("collab status", { roomId, status });
+      setReconnecting(status !== "connected");
+    };
+
+    provider.on("status", handleStatus);
+    setCollab({ doc, provider });
+
+    return () => {
+      provider.off("status", handleStatus);
+      provider.destroy();
+      doc.destroy();
+      setCollab(null);
+    };
+  }, [roomId, username, myColor]);
+
+  // ─── Bind the document to the editor ─────────────────────────
+  useEffect(() => {
+    if (!collab || !editor) return;
+
+    const model = editor.getModel();
+    if (!model) return;
+
+    const binding = new MonacoBinding(
+      collab.doc.getText(TEXT_KEY),
+      model,
+      new Set([editor]),
+      collab.provider.awareness
+    );
+
+    debugRealtime("monaco bound", { roomId });
+
+    return () => binding.destroy();
+  }, [collab, editor, roomId]);
+
+  // ─── Language, shared through the document ───────────────────
+  useEffect(() => {
+    if (!collab) return;
+
+    const meta = collab.doc.getMap(META_KEY);
+
+    const syncLanguage = () => {
+      const next = meta.get("language");
+      if (typeof next === "string") {
+        setLanguage(next);
+      }
+    };
+
+    syncLanguage();
+    meta.observe(syncLanguage);
+
+    return () => meta.unobserve(syncLanguage);
+  }, [collab]);
+
+  // ─── Presence and remote cursor colors, from awareness ───────
+  useEffect(() => {
+    if (!collab) return;
+
+    const { awareness } = collab.provider;
+    const styleEl = document.createElement("style");
+    document.head.appendChild(styleEl);
+
+    let knownNames = new Map<number, string>();
+    let isFirstUpdate = true;
+
+    const handleAwareness = () => {
+      const states = awareness.getStates();
+
+      const users: ConnectedUser[] = [];
+      const rules: string[] = [];
+
+      states.forEach((state, clientId) => {
+        const info = (state as { user?: { name?: string; color?: string } })
+          .user;
+        const name = info?.name || "Guest";
+        const color =
+          info?.color || USER_COLORS[clientId % USER_COLORS.length] || "#3b82f6";
+
+        users.push({
+          clientId,
+          username: name,
+          color,
+          isSelf: clientId === awareness.clientID,
+        });
+
+        if (clientId !== awareness.clientID) {
+          // y-monaco emits per-client class names but no colors, so the
+          // caret and selection styling is supplied here.
+          rules.push(
+            `.yRemoteSelection-${clientId} { background-color: ${color}33; }`,
+            `.yRemoteSelectionHead-${clientId} { border-left: 2px solid ${color}; border-top: 2px solid ${color}; }`,
+            `.yRemoteSelectionHead-${clientId}::after { background-color: ${color}; content: ${JSON.stringify(name)}; }`
+          );
+        }
+      });
+
+      styleEl.textContent = rules.join("\n");
+      setConnectedUsers(users);
+
+      // Announce arrivals and departures, skipping the initial snapshot.
+      const nextNames = new Map(
+        users.map((entry) => [entry.clientId, entry.username])
+      );
+
+      if (!isFirstUpdate) {
+        nextNames.forEach((name, clientId) => {
+          if (!knownNames.has(clientId) && clientId !== awareness.clientID) {
+            showToast(`${name} joined`);
+          }
+        });
+        knownNames.forEach((name, clientId) => {
+          if (!nextNames.has(clientId)) {
+            showToast(`${name} left`);
+          }
+        });
       }
 
-      debugRealtime("join-room", { roomId, socketId: socket.id, username });
-      socket.emit("join-room", { roomId, username });
-      joinedRoomRef.current = roomId;
+      knownNames = nextNames;
+      isFirstUpdate = false;
     };
 
-    // ── Handlers (defined BEFORE join so no events are missed) ──
-    const handleReceiveCode = (incoming: string) => {
-      debugRealtime("receive-code", { roomId, length: incoming.length });
-      setCode(incoming);
+    handleAwareness();
+    awareness.on("change", handleAwareness);
+
+    return () => {
+      awareness.off("change", handleAwareness);
+      styleEl.remove();
     };
-    const handleReceiveLanguage = (lang: string) => {
-      debugRealtime("receive-language", { roomId, language: lang });
-      setLanguage(lang);
-    };
-    const handleReceiveOutput = (out: string) => { setOutput(out); setIsError(false); };
-    const handleUserCount = (count: number) => setUserCount(count);
-    const handleUserList = (users: { id: string; username: string }[]) => {
-      debugRealtime("user-list", { roomId, users });
-      const activeUserIds = new Set(users.map((u) => u.id));
-      setRemoteCursors((prev) =>
-        Object.fromEntries(
-          Object.entries(prev).filter(([userId]) => activeUserIds.has(userId))
-        )
-      );
-      setConnectedUsers(
-        users.map((u, i) => ({ ...u, color: USER_COLORS[i % USER_COLORS.length] }))
-      );
-    };
-    const handleRoomNotice = (msg: string) => showToast(msg);
-    const handleCurrentState = ({ code: c, language: l }: any) => {
-      debugRealtime("receive-current-state", { roomId, length: c.length, language: l });
-      setCode(c);
-      setLanguage(l);
-    };
-    const handleReceiveCursor = ({
-      userId,
-      line,
-      column,
-    }: {
-      userId: string;
-      line: number;
-      column: number;
-    }) => {
-      debugRealtime("receive-cursor", { roomId, userId, line, column });
-      setRemoteCursors((prev) => ({
-        ...prev,
-        [userId]: { userId, line, column },
-      }));
-    };
-    const handleConnect = () => {
-      setReconnecting(false);
-      joinedRoomRef.current = null;
-      debugRealtime("socket connected", { roomId, socketId: socket.id });
-      joinRoom();
-    };
-    const handleDisconnect = (reason: string) => {
-      debugRealtime("socket disconnected", { roomId, reason, socketId: socket.id });
-      joinedRoomRef.current = null;
-      setRemoteCursors({});
-      setReconnecting(true);
+  }, [collab, showToast]);
+
+  // ─── Save status ─────────────────────────────────────────────
+  // The server owns persistence; it emits room-saved once the debounce
+  // has flushed to Postgres.
+  useEffect(() => {
+    if (!collab) return;
+
+    const handleUpdate = () => {
+      setSaveStatus("unsaved");
+
+      if (savingTimerRef.current) clearTimeout(savingTimerRef.current);
+      savingTimerRef.current = setTimeout(() => setSaveStatus("saving"), 2000);
     };
 
-    // ── Register listeners FIRST ─────────────────────────────────
-    socket.on("receive-code", handleReceiveCode);
-    socket.on("receive-language", handleReceiveLanguage);
+    collab.doc.on("update", handleUpdate);
+
+    return () => {
+      collab.doc.off("update", handleUpdate);
+      if (savingTimerRef.current) clearTimeout(savingTimerRef.current);
+    };
+  }, [collab]);
+
+  // ─── Socket.IO: run output + save notifications only ─────────
+  useEffect(() => {
+    if (!roomId) return;
+
+    const handleReceiveOutput = (out: string) => {
+      setOutput(out);
+      setIsError(false);
+    };
+    const handleRoomSaved = () => {
+      if (savingTimerRef.current) clearTimeout(savingTimerRef.current);
+      setSaveStatus("saved");
+    };
+    const joinRoom = () => socket.emit("join-room", { roomId });
+
     socket.on("receive-output", handleReceiveOutput);
-    socket.on("user-count", handleUserCount);
-    socket.on("user-list", handleUserList);
-    socket.on("room-notice", handleRoomNotice);
-    socket.on("receive-current-state", handleCurrentState);
-    socket.on("receive-cursor", handleReceiveCursor);
-    socket.on("connect", handleConnect);
-    socket.on("disconnect", handleDisconnect);
+    socket.on("room-saved", handleRoomSaved);
+    socket.on("connect", joinRoom);
 
-    // ── Join room AFTER listeners are ready ──────────────────────
-    if (socket.connected) {
-      joinRoom();
-    }
+    if (socket.connected) joinRoom();
 
     return () => {
-      debugRealtime("leave-room", { roomId, socketId: socket.id, username });
-      socket.emit("leave-room", { roomId, username });
-      if (joinedRoomRef.current === roomId) {
-        joinedRoomRef.current = null;
-      }
-      socket.off("receive-code", handleReceiveCode);
-      socket.off("receive-language", handleReceiveLanguage);
+      socket.emit("leave-room", { roomId });
       socket.off("receive-output", handleReceiveOutput);
-      socket.off("user-count", handleUserCount);
-      socket.off("user-list", handleUserList);
-      socket.off("room-notice", handleRoomNotice);
-      socket.off("receive-current-state", handleCurrentState);
-      socket.off("receive-cursor", handleReceiveCursor);
-      socket.off("connect", handleConnect);
-      socket.off("disconnect", handleDisconnect);
-    };
-  }, [roomId, username]);
-
-  // Handle request-current-state separately so it always has the latest code/language
-  useEffect(() => {
-    if (!roomId) return;
-
-    const handleRequestState = (newUserId: string) => {
-      debugRealtime("send-current-state", {
-        roomId,
-        targetId: newUserId,
-        length: latestCodeRef.current.length,
-        language: latestLanguageRef.current,
-      });
-      socket.emit("send-current-state", {
-        targetId: newUserId,
-        code: latestCodeRef.current,
-        language: latestLanguageRef.current,
-      });
-    };
-
-    socket.on("request-current-state", handleRequestState);
-
-    return () => {
-      socket.off("request-current-state", handleRequestState);
+      socket.off("room-saved", handleRoomSaved);
+      socket.off("connect", joinRoom);
     };
   }, [roomId, socket]);
 
-  // Load room from backend on mount
+  // Track the room locally for the dashboard's recent list.
   useEffect(() => {
     if (!roomId) return;
-    roomApi.get(roomId).then((res) => {
-      if (res.data) {
-        setCode(res.data.code);
-        setLanguage(res.data.language);
-      }
-    }).catch(() => {});
 
-    // Track in recent rooms
     const stored = localStorage.getItem("codemesh_recent_rooms");
     let rooms = [];
     try { rooms = stored ? JSON.parse(stored) : []; } catch { rooms = []; }
@@ -240,112 +286,22 @@ const EditorRoom = () => {
       ...rooms.filter((r: any) => r.room_id !== roomId),
     ].slice(0, 10);
     localStorage.setItem("codemesh_recent_rooms", JSON.stringify(updated));
-  }, [roomId]);
-
-  useEffect(() => {
-    const editor = editorRef.current;
-    const monaco = monacoRef.current;
-
-    if (!editor || !monaco) {
-      return;
-    }
-
-    const model = editor.getModel();
-    if (!model) {
-      return;
-    }
-
-    const connectedUserMap = new Map(
-      connectedUsers.map((participant) => [participant.id, participant])
-    );
-
-    const decorations = Object.values(remoteCursors).flatMap((cursor) => {
-      const participant = connectedUserMap.get(cursor.userId);
-
-      if (!participant || cursor.userId === socket.id) {
-        return [];
-      }
-
-      const colorIndex = Math.max(USER_COLORS.indexOf(participant.color), 0);
-      const safeLine = Math.min(
-        Math.max(cursor.line, 1),
-        model.getLineCount()
-      );
-      const safeColumn = Math.min(
-        Math.max(cursor.column, 1),
-        model.getLineMaxColumn(safeLine)
-      );
-
-      return [
-        {
-          range: new monaco.Range(safeLine, 1, safeLine, 1),
-          options: {
-            isWholeLine: true,
-            className: `cm-remote-cursor-line cm-remote-cursor-line-${colorIndex}`,
-            linesDecorationsClassName: `cm-remote-cursor-glyph cm-remote-cursor-glyph-${colorIndex}`,
-            hoverMessage: {
-              value: `${participant.username} is active here`,
-            },
-          },
-        },
-        {
-          range: new monaco.Range(safeLine, safeColumn, safeLine, safeColumn),
-          options: {
-            afterContentClassName: `cm-remote-cursor-caret cm-remote-cursor-caret-${colorIndex}`,
-            hoverMessage: {
-              value: `${participant.username} is active here`,
-            },
-          },
-        },
-      ];
-    });
-
-    remoteDecorationIdsRef.current = editor.deltaDecorations(
-      remoteDecorationIdsRef.current,
-      decorations
-    );
-  }, [connectedUsers, remoteCursors, code, socket.id]);
-
-  // Autosave
-  useEffect(() => {
-    if (!roomId) return;
-    setSaveStatus("unsaved");
-    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
-    saveTimerRef.current = setTimeout(async () => {
-      setSaveStatus("saving");
-      try {
-        await roomApi.save(roomId, code, language);
-        setSaveStatus("saved");
-        // Update recent rooms language
-        const stored = localStorage.getItem("codemesh_recent_rooms");
-        if (stored) {
-          const rooms = JSON.parse(stored).map((r: any) =>
-            r.room_id === roomId ? { ...r, language, updated_at: new Date().toISOString() } : r
-          );
-          localStorage.setItem("codemesh_recent_rooms", JSON.stringify(rooms));
-        }
-      } catch { setSaveStatus("unsaved"); }
-    }, 2000);
-    return () => { if (saveTimerRef.current) clearTimeout(saveTimerRef.current); };
-  }, [code, language, roomId]);
-
-  const handleCodeChange = useCallback((val: string) => {
-    setCode(val);
-    debugRealtime("code-change", { roomId, length: val.length });
-    socket.emit("code-change", { roomId, code: val });
-  }, [roomId, socket]);
+  }, [roomId, language]);
 
   const handleLanguageChange = (lang: string) => {
+    // Written to the document so every client follows, including late joiners.
+    collab?.doc.getMap(META_KEY).set("language", lang);
     setLanguage(lang);
-    debugRealtime("language-change", { roomId, language: lang });
-    socket.emit("language-change", { roomId, language: lang });
   };
 
   const runCode = async () => {
+    const code = collab?.doc.getText(TEXT_KEY).toString() ?? "";
+
     setRunning(true);
     setOutput("");
     setIsError(false);
     setOutputTab("output");
+
     try {
       const res = await roomApi.run(code, language, input);
       const out = res.data.output || "No output";
@@ -368,8 +324,9 @@ const EditorRoom = () => {
     name.split(" ").map(w => w[0]).join("").toUpperCase().slice(0, 2);
 
   const langInfo = LANGUAGES.find(l => l.value === language) || LANGUAGES[0];
+  const others = connectedUsers.filter((entry) => !entry.isSelf);
+  const userCount = connectedUsers.length || 1;
 
-  // Save status indicator
   const saveIndicator = {
     saved: { color: "text-green-400", icon: "✓", label: "Saved" },
     saving: { color: "text-yellow-400", icon: "◌", label: "Saving…" },
@@ -541,71 +498,52 @@ const EditorRoom = () => {
             </div>
 
             <div className="flex-1 overflow-y-auto p-3">
-                <div className="text-[10px] text-slate-600 uppercase tracking-wider mb-2 px-1">
-                  Online — {userCount}
+              <div className="text-[10px] text-slate-600 uppercase tracking-wider mb-2 px-1">
+                Online — {userCount}
+              </div>
+
+              {/* Self */}
+              <div className="flex items-center gap-2.5 px-2 py-2 rounded-lg hover:bg-white/3">
+                <div className="w-7 h-7 rounded-full flex items-center justify-center text-[10px] font-bold text-white flex-shrink-0"
+                  style={{ backgroundColor: myColor }}>
+                  {initials(username)}
                 </div>
-                {/* Self */}
-                <div className="flex items-center gap-2.5 px-2 py-2 rounded-lg hover:bg-white/3">
+                <div className="min-w-0">
+                  <div className="text-xs font-medium text-white truncate">{username}</div>
+                  <div className="text-[10px] text-slate-600">You</div>
+                </div>
+                <span className="ml-auto w-2 h-2 rounded-full bg-green-400 flex-shrink-0" />
+              </div>
+
+              {/* Others — from Yjs awareness */}
+              {others.map((entry) => (
+                <div key={entry.clientId} className="flex items-center gap-2.5 px-2 py-2 rounded-lg hover:bg-white/3">
                   <div className="w-7 h-7 rounded-full flex items-center justify-center text-[10px] font-bold text-white flex-shrink-0"
-                    style={{ backgroundColor: myColor }}>
-                    {initials(username)}
+                    style={{ backgroundColor: entry.color }}>
+                    {initials(entry.username)}
                   </div>
                   <div className="min-w-0">
-                    <div className="text-xs font-medium text-white truncate">{username}</div>
-                    <div className="text-[10px] text-slate-600">You</div>
+                    <div className="text-xs font-medium text-slate-300 truncate">{entry.username}</div>
                   </div>
                   <span className="ml-auto w-2 h-2 rounded-full bg-green-400 flex-shrink-0" />
                 </div>
-
-                {/* Others — real names from user-list event */}
-                {connectedUsers
-                  .filter(u => u.username !== username)
-                  .map((u) => (
-                    <div key={u.id} className="flex items-center gap-2.5 px-2 py-2 rounded-lg hover:bg-white/3">
-                      <div className="w-7 h-7 rounded-full flex items-center justify-center text-[10px] font-bold text-white flex-shrink-0"
-                        style={{ backgroundColor: u.color }}>
-                        {initials(u.username)}
-                      </div>
-                      <div className="min-w-0">
-                        <div className="text-xs font-medium text-slate-300 truncate">{u.username}</div>
-                        {remoteCursors[u.id] && (
-                          <div className="text-[10px] text-slate-500">
-                            Line {remoteCursors[u.id].line}
-                          </div>
-                        )}
-                      </div>
-                      <span className="ml-auto w-2 h-2 rounded-full bg-green-400 flex-shrink-0" />
-                    </div>
-                  ))}
+              ))}
             </div>
           </aside>
         )}
 
         {/* ── CENTER — EDITOR + CONSOLE ── */}
         <div className="flex-1 flex flex-col overflow-hidden">
-          {/* Monaco Editor */}
+          {/* Monaco Editor — content is driven by Yjs, not React state */}
           <div className="flex-1 overflow-hidden">
             <Editor
               height="100%"
               theme="vs-dark"
               language={language}
-              value={code}
-              onChange={(val) => handleCodeChange(val || "")}
-              onMount={(editor, monaco) => {
-                editorRef.current = editor;
-                monacoRef.current = monaco;
+              onMount={(mountedEditor) => {
+                setEditor(mountedEditor);
 
-                // Cursor change → broadcast
-                editor.onDidChangeCursorPosition((e) => {
-                  socket.emit("cursor-change", {
-                    roomId,
-                    line: e.position.lineNumber,
-                    column: e.position.column,
-                  });
-                });
-
-                // Premium editor options
-                editor.updateOptions({
+                mountedEditor.updateOptions({
                   fontSize: 14,
                   fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
                   fontLigatures: true,
@@ -621,9 +559,34 @@ const EditorRoom = () => {
                   guides: { bracketPairs: true },
                   suggest: { showWords: true },
                 });
-              }}
-              options={{
-                automaticLayout: true,
+
+                // Size the editor to its parent explicitly. Monaco mis-measures
+                // its container as ~0 when the editor mounts (via the lazy
+                // route) during a frame where the flex layout hasn't resolved,
+                // and freezes at 5x5. Because the container's size never
+                // actually *changes* afterwards, automaticLayout's observer
+                // never fires to correct it — so we lay out to the parent's real
+                // size on the next frames, then keep it in sync on later resizes
+                // (sidebar / console toggles).
+                const parent =
+                  mountedEditor.getContainerDomNode().parentElement;
+                if (parent) {
+                  const fit = () => {
+                    const { width, height } = parent.getBoundingClientRect();
+                    if (width > 0 && height > 0) {
+                      mountedEditor.layout({ width, height });
+                    }
+                  };
+                  // Fire immediately and on a few fallbacks — rAF alone can be
+                  // throttled when the tab isn't actively painting.
+                  fit();
+                  requestAnimationFrame(fit);
+                  setTimeout(fit, 0);
+                  setTimeout(fit, 150);
+                  const resize = new ResizeObserver(fit);
+                  resize.observe(parent);
+                  mountedEditor.onDidDispose(() => resize.disconnect());
+                }
               }}
             />
           </div>

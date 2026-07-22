@@ -1,7 +1,13 @@
 import axios from "axios";
 
+export const SERVER_URL =
+  import.meta.env.VITE_SERVER_URL || "http://localhost:5000";
+
+// Yjs collaboration socket — the provider appends /<roomId>.
+export const COLLAB_WS_URL = `${SERVER_URL.replace(/^http/, "ws")}/yjs`;
+
 export const api = axios.create({
-  baseURL: "http://localhost:5000",
+  baseURL: SERVER_URL,
   withCredentials: true,
 });
 
@@ -18,16 +24,12 @@ export const authApi = {
   logout: () => api.post("/logout"),
 };
 
-// Room helpers
+// Room contents are loaded and saved over the collaboration socket, so the
+// only room request left is code execution.
 export const roomApi = {
-  get: (roomId: string) => api.get(`/room/${roomId}`),
-
-  save: (roomId: string, code: string, language: string) =>
-    api.post("/save-room", { roomId, code, language }),
-
   run: (code: string, language: string, input: string) =>
     api.post("/run", { code, language, input }),
 };
 
 // Google OAuth — backend redirect
-export const GOOGLE_AUTH_URL = "http://localhost:5000/auth/google";
+export const GOOGLE_AUTH_URL = `${SERVER_URL}/auth/google`;

@@ -1,5 +1,12 @@
-// Must be first: ./db reads process.env at import time.
-import "dotenv/config";
+// Must be first: ./config loads dotenv, and ./db reads process.env at import time.
+import {
+  JWT_SECRET,
+  SESSION_SECRET,
+  clientUrl,
+  port,
+  judge0Url,
+  googleAuth,
+} from "./config.js";
 import express, { NextFunction, Request, Response } from "express";
 import cors from "cors";
 import axios from "axios";
@@ -7,42 +14,12 @@ import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 import cookieParser from "cookie-parser";
 import passport from "passport";
+import session from "express-session";
+import { Strategy as GoogleStrategy } from "passport-google-oauth20";
 import { createServer } from "http";
 import { Server } from "socket.io";
-import { pool } from "./db";
-
-const session = require("express-session");
-const {
-  Strategy: GoogleStrategy,
-} = require("passport-google-oauth20");
-
-const requireEnv = (name: string): string => {
-  const value = process.env[name];
-
-  if (!value) {
-    console.error(`Missing required environment variable: ${name}`);
-    console.error("Copy .env.example to .env and fill in the values.");
-    process.exit(1);
-  }
-
-  return value;
-};
-
-const JWT_SECRET = requireEnv("JWT_SECRET");
-const SESSION_SECRET = requireEnv("SESSION_SECRET");
-
-const clientUrl = process.env.CLIENT_URL || "http://localhost:5173";
-const port = Number(process.env.PORT) || 5000;
-const judge0Url =
-  process.env.JUDGE0_URL ||
-  "http://127.0.0.1:2358/submissions?base64_encoded=false&wait=true";
-
-const googleClientId = process.env.GOOGLE_CLIENT_ID;
-const googleClientSecret = process.env.GOOGLE_CLIENT_SECRET;
-const googleCallbackUrl =
-  process.env.GOOGLE_CALLBACK_URL ||
-  `http://localhost:${port}/auth/google/callback`;
-const googleAuthEnabled = Boolean(googleClientId && googleClientSecret);
+import { pool } from "./db.js";
+import { attachCollabServer } from "./collab.js";
 
 const app = express();
 
@@ -55,7 +32,7 @@ app.use(
 );
 app.use(
   cors({
-    origin: process.env.CLIENT_URL || "http://localhost:5173",
+    origin: clientUrl,
     credentials: true,
   })
 );
@@ -82,58 +59,58 @@ passport.deserializeUser((user: any, done) => {
   done(null, user as any);
 });
 
-if (!googleAuthEnabled) {
+if (!googleAuth) {
   console.warn(
     "GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET not set — Google sign-in is disabled."
   );
 }
 
-if (googleAuthEnabled) {
+if (googleAuth) {
   passport.use(
-  new GoogleStrategy(
-    {
-      clientID: googleClientId,
-      clientSecret: googleClientSecret,
-      callbackURL: googleCallbackUrl,
-    },
-    async (
-      _accessToken: any,
-      _refreshToken: any,
-      profile: any,
-      done: any
-    ) => {
-      try {
-        const email = profile.emails?.[0]?.value;
-        const username = profile.displayName;
+    new GoogleStrategy(
+      {
+        clientID: googleAuth.clientId,
+        clientSecret: googleAuth.clientSecret,
+        callbackURL: googleAuth.callbackUrl,
+      },
+      async (
+        _accessToken: any,
+        _refreshToken: any,
+        profile: any,
+        done: any
+      ) => {
+        try {
+          const email = profile.emails?.[0]?.value;
+          const username = profile.displayName;
 
-        let result = await pool.query(
-          "SELECT * FROM users WHERE email = $1",
-          [email]
-        );
-
-        let user;
-
-        if (result.rows.length === 0) {
-          const newUser = await pool.query(
-            `
-            INSERT INTO users (username, email, password)
-            VALUES ($1, $2, $3)
-            RETURNING *
-            `,
-            [username, email, "google_oauth"]
+          const result = await pool.query(
+            "SELECT * FROM users WHERE email = $1",
+            [email]
           );
 
-          user = newUser.rows[0];
-        } else {
-          user = result.rows[0];
-        }
+          let user;
 
-        done(null, user);
-      } catch (error) {
-        done(error as any, null);
+          if (result.rows.length === 0) {
+            const newUser = await pool.query(
+              `
+              INSERT INTO users (username, email, password)
+              VALUES ($1, $2, $3)
+              RETURNING *
+              `,
+              [username, email, "google_oauth"]
+            );
+
+            user = newUser.rows[0];
+          } else {
+            user = result.rows[0];
+          }
+
+          done(null, user);
+        } catch (error) {
+          done(error as any, null);
+        }
       }
-    }
-  )
+    )
   );
 }
 
@@ -274,7 +251,7 @@ app.post("/login", async (req, res) => {
   }
 });
 
-if (googleAuthEnabled) {
+if (googleAuth) {
   app.get(
     "/auth/google",
     passport.authenticate("google", {
@@ -397,31 +374,9 @@ app.post("/run", authMiddleware, async (req, res) => {
 });
 
 
-app.post("/save-room", authMiddleware, async (req, res) => {
-  try {
-    const { roomId, code, language } = req.body;
-
-    await pool.query(
-      `
-      INSERT INTO rooms (room_id, code, language)
-      VALUES ($1, $2, $3)
-      ON CONFLICT (room_id)
-      DO UPDATE SET
-        code = EXCLUDED.code,
-        language = EXCLUDED.language,
-        updated_at = CURRENT_TIMESTAMP
-      `,
-      [roomId, code, language]
-    );
-
-    res.json({ success: true });
-  } catch (error) {
-    console.log(error);
-    res.status(500).json({ success: false });
-  }
-});
-
-
+// NOTE: there is deliberately no /save-room endpoint. Rooms are persisted by
+// the collaboration server (see collab.ts), which owns the live document. A
+// second write path would let a client clobber the document behind Yjs's back.
 
 app.get("/room/:roomId", authMiddleware, async (req, res) => {
   try {
@@ -449,159 +404,28 @@ const io = new Server(httpServer, {
   },
 });
 
-const buildRoomPresence = (roomId: string, excludeSocketId?: string) => {
-  const room = io.sockets.adapter.rooms.get(roomId);
-  const socketIds = Array.from(room?.keys() ?? []).filter(
-    (sid) => sid !== excludeSocketId
-  );
-
-  return {
-    count: socketIds.length,
-    userList: socketIds.map((sid) => ({
-      id: sid,
-      username:
-        io.sockets.sockets.get(sid)?.data?.username || "Guest",
-    })),
-  };
-};
-
+// Socket.IO now only carries run output and save notifications. The document,
+// language, cursors and presence all travel over the Yjs connection in
+// collab.ts, so the old code-change / cursor / state-handoff events are gone.
 io.on("connection", (socket) => {
-  console.log("User connected:", socket.id);
-
-  const emitRoomPresence = (
-    roomId: string,
-    options?: { excludeSocketId?: string; broadcastOnly?: boolean }
-  ) => {
-    const { count, userList } = buildRoomPresence(
-      roomId,
-      options?.excludeSocketId
-    );
-    const target = options?.broadcastOnly ? socket.to(roomId) : io.to(roomId);
-
-    target.emit("user-count", count);
-    target.emit("user-list", userList);
-
-    console.log(
-      `[room:${roomId}] presence -> ${count} users`,
-      userList.map((user) => `${user.username}:${user.id}`)
-    );
-  };
-
-  const leaveRoom = (roomId: string, username?: string) => {
-    if (!socket.rooms.has(roomId)) {
-      return;
-    }
-
-    socket.leave(roomId);
-    socket.to(roomId).emit(
-      "room-notice",
-      `${username || socket.data.username || "Someone"} left`
-    );
-    emitRoomPresence(roomId);
-
-    console.log(
-      `${username || socket.data.username || "Someone"} (${socket.id}) left ${roomId}`
-    );
-  };
-
-  socket.on("join-room", ({ roomId, username }) => {
-    socket.data.username = username;
-    if (socket.rooms.has(roomId)) {
-      console.log(
-        `[join-room] duplicate ignored for ${username} (${socket.id}) in ${roomId}`
-      );
-      emitRoomPresence(roomId);
-      return;
-    }
-
+  socket.on("join-room", ({ roomId }: { roomId: string }) => {
     socket.join(roomId);
-    console.log(
-      `[join-room] requesting current state for ${socket.id} in ${roomId}`
-    );
-    socket.to(roomId).emit("request-current-state", socket.id);
-    socket.to(roomId).emit("room-notice", `${username} joined`);
-
-    emitRoomPresence(roomId);
-
-    const { count } = buildRoomPresence(roomId);
-    const room = io.sockets.adapter.rooms.get(roomId);
-
-    // Broadcast full user list with names so sidebar shows real names
-    const userList = Array.from(room?.keys() ?? []).map((sid) => ({
-      id: sid,
-      username: io.sockets.sockets.get(sid)?.data?.username || "Guest",
-    }));
-    io.to(roomId).emit("user-list", userList);
-
-    console.log(`${username} (${socket.id}) joined ${roomId} — ${count} users`);
   });
 
-  socket.on("leave-room", ({ roomId, username }) => {
-    leaveRoom(roomId, username);
+  socket.on("leave-room", ({ roomId }: { roomId: string }) => {
+    socket.leave(roomId);
   });
 
-  socket.on("code-change", ({ roomId, code }) => {
-    console.log(
-      `[code-change] room=${roomId} socket=${socket.id} length=${code?.length ?? 0}`
-    );
-    socket.to(roomId).emit("receive-code", code);
-  });
+  socket.on(
+    "send-output",
+    ({ roomId, output }: { roomId: string; output: string }) => {
+      socket.to(roomId).emit("receive-output", output);
+    }
+  );
+});
 
-  socket.on("language-change", ({ roomId, language }) => {
-    console.log(
-      `[language-change] room=${roomId} socket=${socket.id} language=${language}`
-    );
-    socket.to(roomId).emit("receive-language", language);
-  });
-
-  socket.on("cursor-change", ({ roomId, line, column }) => {
-    socket.to(roomId).emit("receive-cursor", {
-      userId: socket.id,
-      line,
-      column,
-    });
-  });
-
-  socket.on("send-output", ({ roomId, output }) => {
-    socket.to(roomId).emit("receive-output", output);
-  });
-
-  socket.on("send-current-state", ({ targetId, code, language }) => {
-    console.log(
-      `[send-current-state] from=${socket.id} to=${targetId} length=${code?.length ?? 0} language=${language}`
-    );
-    io.to(targetId).emit("receive-current-state", {
-      code,
-      language,
-    });
-  });
-
-  socket.on("disconnecting", () => {
-    const username = socket.data.username || "Someone";
-
-    socket.rooms.forEach((roomId) => {
-      if (roomId !== socket.id) {
-        const room = io.sockets.adapter.rooms.get(roomId);
-        const count = room ? room.size - 1 : 0;
-
-        io.to(roomId).emit("user-count", count);
-        socket.to(roomId).emit("room-notice", `${username} left`);
-
-        // Send updated user list (excluding the leaving socket)
-        const userList = Array.from(room?.keys() ?? [])
-          .filter((sid) => sid !== socket.id)
-          .map((sid) => ({
-            id: sid,
-            username: io.sockets.sockets.get(sid)?.data?.username || "Guest",
-          }));
-        socket.to(roomId).emit("user-list", userList);
-      }
-    });
-  });
-
-  socket.on("disconnect", () => {
-    console.log("User disconnected");
-  });
+attachCollabServer(httpServer, (roomId) => {
+  io.to(roomId).emit("room-saved");
 });
 
 httpServer.listen(port, () => {
