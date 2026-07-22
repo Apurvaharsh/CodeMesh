@@ -29,12 +29,17 @@ const DEFAULT_CODE = "// code here";
 const DEFAULT_LANGUAGE = "javascript";
 const SAVE_DEBOUNCE_MS = 2000;
 const PING_INTERVAL_MS = 30000;
+// Keep an emptied room's document alive briefly so a refresh (disconnect →
+// reconnect) doesn't tear down in-memory state like chat history before the
+// client comes back.
+const ROOM_GRACE_MS = 60000;
 
 interface Room {
   doc: Y.Doc;
   awareness: awarenessProtocol.Awareness;
   connections: Map<WebSocket, Set<number>>;
   saveTimer: NodeJS.Timeout | null;
+  graceTimer: NodeJS.Timeout | null;
 }
 
 const rooms = new Map<string, Promise<Room>>();
@@ -99,6 +104,7 @@ const createRoom = async (
     awareness,
     connections: new Map(),
     saveTimer: null,
+    graceTimer: null,
   };
 
   const broadcast = (message: Uint8Array) => {
@@ -171,26 +177,35 @@ const getRoom = (roomId: string, onRoomSaved?: (roomId: string) => void) => {
   return pending;
 };
 
-const closeRoomIfEmpty = async (roomId: string, room: Room) => {
-  if (room.connections.size > 0) {
+const scheduleRoomClose = (roomId: string, room: Room) => {
+  if (room.connections.size > 0 || room.graceTimer) {
     return;
   }
 
-  if (room.saveTimer) {
-    clearTimeout(room.saveTimer);
-    room.saveTimer = null;
-  }
+  room.graceTimer = setTimeout(async () => {
+    room.graceTimer = null;
 
-  rooms.delete(roomId);
+    // A client reconnected during the grace window — keep the room alive.
+    if (room.connections.size > 0) {
+      return;
+    }
 
-  try {
-    await persistRoom(roomId, room.doc);
-    console.log(`[collab] room ${roomId} closed and saved`);
-  } catch (error) {
-    console.error(`[collab] final save failed for ${roomId}:`, error);
-  } finally {
-    room.doc.destroy();
-  }
+    if (room.saveTimer) {
+      clearTimeout(room.saveTimer);
+      room.saveTimer = null;
+    }
+
+    rooms.delete(roomId);
+
+    try {
+      await persistRoom(roomId, room.doc);
+      console.log(`[collab] room ${roomId} closed and saved`);
+    } catch (error) {
+      console.error(`[collab] final save failed for ${roomId}:`, error);
+    } finally {
+      room.doc.destroy();
+    }
+  }, ROOM_GRACE_MS);
 };
 
 const setupConnection = (
@@ -199,6 +214,12 @@ const setupConnection = (
   room: Room,
   onRoomSaved?: (roomId: string) => void
 ) => {
+  // Cancel any pending close — the room is active again.
+  if (room.graceTimer) {
+    clearTimeout(room.graceTimer);
+    room.graceTimer = null;
+  }
+
   room.connections.set(conn, new Set());
 
   conn.binaryType = "arraybuffer";
@@ -267,7 +288,7 @@ const setupConnection = (
       );
     }
 
-    void closeRoomIfEmpty(roomId, room);
+    scheduleRoomClose(roomId, room);
   };
 
   conn.on("close", handleClose);

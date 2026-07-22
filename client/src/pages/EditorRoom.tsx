@@ -86,6 +86,15 @@ const EditorRoom = () => {
   const [myColor] = useState(
     () => USER_COLORS[Math.floor(Math.random() * USER_COLORS.length)]
   );
+  // Stable across refreshes so a user's own past chat messages stay "You".
+  const [clientId] = useState(() => {
+    let id = localStorage.getItem("codemesh_client_id");
+    if (!id) {
+      id = crypto.randomUUID();
+      localStorage.setItem("codemesh_client_id", id);
+    }
+    return id;
+  });
   const savingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const chatEndRef = useRef<HTMLDivElement | null>(null);
   const lastSeenChatRef = useRef(0);
@@ -272,14 +281,10 @@ const EditorRoom = () => {
       if (savingTimerRef.current) clearTimeout(savingTimerRef.current);
       setSaveStatus("saved");
     };
-    const handleReceiveChat = (message: ChatMessage) => {
-      setChatMessages((prev) => [...prev, message]);
-    };
     const joinRoom = () => socket.emit("join-room", { roomId });
 
     socket.on("receive-output", handleReceiveOutput);
     socket.on("room-saved", handleRoomSaved);
-    socket.on("receive-chat", handleReceiveChat);
     socket.on("connect", joinRoom);
 
     if (socket.connected) joinRoom();
@@ -288,10 +293,39 @@ const EditorRoom = () => {
       socket.emit("leave-room", { roomId });
       socket.off("receive-output", handleReceiveOutput);
       socket.off("room-saved", handleRoomSaved);
-      socket.off("receive-chat", handleReceiveChat);
       socket.off("connect", joinRoom);
     };
   }, [roomId, socket]);
+
+  // ─── Chat, carried in the shared document ────────────────────
+  // Living in the Yjs doc (not ephemeral socket state) means chat syncs to
+  // late joiners and survives a refresh: on reconnect the doc re-syncs and the
+  // history comes back with it.
+  useEffect(() => {
+    if (!collab) return;
+
+    const chatArray = collab.doc.getArray<ChatMessage>("chat");
+    const sync = () => setChatMessages(chatArray.toArray());
+
+    // Once the initial history has synced from the server, treat it as already
+    // seen so a refresh doesn't badge the whole reloaded backlog as unread.
+    let baselined = false;
+    const onSynced = (isSynced: boolean) => {
+      if (isSynced && !baselined) {
+        baselined = true;
+        lastSeenChatRef.current = chatArray.length;
+      }
+    };
+
+    sync();
+    chatArray.observe(sync);
+    collab.provider.on("sync", onSynced);
+
+    return () => {
+      chatArray.unobserve(sync);
+      collab.provider.off("sync", onSynced);
+    };
+  }, [collab]);
 
   // While chat is open, keep it scrolled to the newest message and mark
   // everything seen; while it's hidden, badge the count of unseen messages.
@@ -354,10 +388,18 @@ const EditorRoom = () => {
 
   const sendChat = () => {
     const text = chatInput.trim();
-    if (!text) return;
-    // Broadcast only — the server echoes to everyone (us included), so we
-    // render from receive-chat rather than appending locally.
-    socket.emit("send-chat", { roomId, user: username, text });
+    if (!text || !collab) return;
+    // Append to the shared array; the observer re-renders every client,
+    // including us, so there is no separate local echo.
+    collab.doc.getArray<ChatMessage>("chat").push([
+      {
+        id: crypto.randomUUID(),
+        senderId: clientId,
+        user: username,
+        text: text.slice(0, 2000),
+        time: Date.now(),
+      },
+    ]);
     setChatInput("");
   };
 
@@ -600,7 +642,7 @@ const EditorRoom = () => {
                     </div>
                   ) : (
                     chatMessages.map((m) => {
-                      const mine = m.senderId === socket.id;
+                      const mine = m.senderId === clientId;
                       return (
                         <div key={m.id} className={`text-xs ${mine ? "text-right" : ""}`}>
                           <div className="text-[10px] text-slate-600 mb-0.5">
