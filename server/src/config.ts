@@ -21,6 +21,7 @@ export const port = Number(process.env.PORT) || 5000;
 export const judge0Url =
   process.env.JUDGE0_URL ||
   "http://127.0.0.1:2358/submissions?base64_encoded=false&wait=true";
+export const redisUrl = process.env.REDIS_URL || "redis://localhost:6379";
 
 // Null when unconfigured, so callers get narrowed non-optional strings rather
 // than having to assert them.

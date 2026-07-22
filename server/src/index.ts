@@ -5,6 +5,7 @@ import {
   clientUrl,
   port,
   judge0Url,
+  redisUrl,
   googleAuth,
 } from "./config.js";
 import express, { NextFunction, Request, Response } from "express";
@@ -18,10 +19,73 @@ import session from "express-session";
 import { Strategy as GoogleStrategy } from "passport-google-oauth20";
 import { createServer } from "http";
 import { Server } from "socket.io";
+import rateLimit from "express-rate-limit";
+import { RedisStore } from "rate-limit-redis";
+import { createClient } from "redis";
 import { pool } from "./db.js";
 import { attachCollabServer } from "./collab.js";
 
 const app = express();
+
+// ── Rate limiting (Redis-backed) ─────────────────────────────
+// Counters live in Redis so they survive restarts and are shared across
+// instances, rather than being per-process in memory.
+const redisClient = createClient({ url: redisUrl });
+redisClient.on("error", (err) =>
+  console.error("[redis] client error:", err.message)
+);
+
+try {
+  await redisClient.connect();
+  console.log("Connected to Redis for rate limiting");
+} catch (err) {
+  console.warn(
+    "[redis] could not connect at startup — rate limits fail open until Redis is reachable:",
+    (err as Error).message
+  );
+}
+
+const makeLimiter = (options: {
+  windowMs: number;
+  limit: number;
+  prefix: string;
+  handler: (req: Request, res: Response) => void;
+}) =>
+  rateLimit({
+    windowMs: options.windowMs,
+    limit: options.limit,
+    standardHeaders: true,
+    legacyHeaders: false,
+    // If Redis is briefly unavailable, allow the request rather than 500.
+    passOnStoreError: true,
+    handler: options.handler,
+    store: new RedisStore({
+      prefix: options.prefix,
+      sendCommand: (...args: string[]) => redisClient.sendCommand(args),
+    }),
+  });
+
+// Code execution hits Judge0, so it is the most expensive endpoint to abuse.
+const runLimiter = makeLimiter({
+  windowMs: 60_000,
+  limit: 30,
+  prefix: "codemesh:rl:run:",
+  handler: (_req, res) =>
+    res.status(429).json({
+      output: "Too many runs — please wait a moment before running again.",
+    }),
+});
+
+// Brute-force protection for credential endpoints.
+const authLimiter = makeLimiter({
+  windowMs: 15 * 60_000,
+  limit: 20,
+  prefix: "codemesh:rl:auth:",
+  handler: (_req, res) =>
+    res.status(429).json({
+      message: "Too many attempts. Please try again later.",
+    }),
+});
 
 app.use(
   session({
@@ -140,7 +204,7 @@ const authMiddleware = (
   }
 };
 
-app.post("/signup", async (req, res) => {
+app.post("/signup", authLimiter, async (req, res) => {
   try {
     const { username, email, password } = req.body;
 
@@ -192,7 +256,7 @@ app.post("/signup", async (req, res) => {
 });
 
 
-app.post("/login", async (req, res) => {
+app.post("/login", authLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
 
@@ -319,7 +383,7 @@ app.post("/logout", (req, res) => {
   });
 });
 
-app.post("/run", authMiddleware, async (req, res) => {
+app.post("/run", runLimiter, authMiddleware, async (req, res) => {
   try {
     const { code, language, input } = req.body;
     const languageId = languageMap[language];
